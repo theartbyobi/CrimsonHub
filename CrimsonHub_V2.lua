@@ -1,5 +1,5 @@
 --!nocheck
--- CRIMSON HUB 2.0.2 QA | Independent source | No downloaded code or external UI.
+-- CRIMSON HUB 2.0.3 QA | Independent source | No downloaded code or external UI.
 -- Live Blox Fruits / executor validation has NOT been performed.
 -- Source-observed schemas are revalidated at runtime. Never writes NPC health,
 -- quest progress, mastery, inventory, collision, hidden properties or hit packets.
@@ -7,7 +7,7 @@
 -- Upload the supplied Luffy PNG to Roblox, then put its real image asset ID here.
 -- Blank preserves the existing text opener; no unrelated image is substituted.
 local Config = {LuffyImageAssetId = "", Debug = true}
-local Hub = {Version = "2.0.2-qa", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
+local Hub = {Version = "2.0.3-qa", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
 local Services = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "TweenService", "UserInputService", "RunService"}) do
     local ok, service = pcall(function() return game:GetService(name) end)
@@ -456,6 +456,18 @@ function QuestTextResolver:Matches(title,row)
     end
     return false
 end
+function QuestTextResolver:MatchesTracker(text,row)
+    -- A replacement panel needs an objective line, not just a target mentioned
+    -- somewhere in a menu. Resolve translations through the same bounded cache.
+    self:Matches(text,row)
+    local aliases = {row.Target, row.Target .. "s"}
+    if row.Target:sub(-1)=="y" then table.insert(aliases,row.Target:sub(1,-2).."ies") end
+    if row.Group==StarterBinding.Group and row.Index==StarterBinding.Index
+        and Logic.Canonical(row.Target)=="bandit" then table.insert(aliases,"Băng Cướp") end
+    if type(self.Cache[row.Target])=="string" then table.insert(aliases,self.Cache[row.Target]) end
+    for _,alias in ipairs(aliases) do if Logic.ObjectiveAliasMatches(text,alias) then return true end end
+    return false
+end
 
 local QuestDatabase = {Status = "NOT_LOADED", Rows = {}, NPCs = {}, Error = nil, Stats = {}}
 function QuestDatabase:Load()
@@ -532,8 +544,10 @@ function QuestStateDetector:Read(expected)
     local primary = main:FindFirstChild("Quest")
     local hasPrimary = primary and primary:IsA("GuiObject")
     if hasPrimary then table.insert(candidates, primary); seen[primary] = true end
-    -- A known tracker has priority over quest menus, tutorials and other panels.
-    while not hasPrimary and queue[index] and index <= 1200 do
+    -- A visible primary tracker remains authoritative. A hidden legacy frame
+    -- must not suppress a replacement tracker with a verified objective/count.
+    local scanAlternates = not hasPrimary or not visibleInGame(primary)
+    while scanAlternates and queue[index] and index <= 1200 do
         local node = queue[index]; index = index + 1
         for _, child in ipairs(node:GetChildren()) do
             if #queue < 1200 then table.insert(queue, child) end
@@ -558,11 +572,21 @@ function QuestStateDetector:Read(expected)
             for _, child in ipairs(node:GetChildren()) do if #nodes < 200 then table.insert(nodes, child) end end
         end
         local text = table.concat(texts, " | ")
-        local match = expected and QuestTextResolver:Matches(text, expected)
-            or QuestSelector:FromTitle(text, LevelDetector:Get() or 1) ~= nil
+        local row = expected or QuestSelector:FromTitle(text, LevelDetector:Get() or 1)
+        local match = row and QuestTextResolver:Matches(text, row)
         local current, total = text:match("(%d+)%s*/%s*(%d+)")
         local view = {Visible = true, Text = text, Count = tonumber(current), Required = tonumber(total), Source = container.Name}
+        if hasPrimary and container ~= primary then
+            -- Menus, hints and a matching kill total alone are not acceptance.
+            if match and QuestTextResolver:MatchesTracker(text,row) and view.Count and view.Required and row.Amount == view.Required
+                and view.Count >= 0 and view.Count <= view.Required then
+                view.Source = container.Name .. " (verified alternate tracker)"
+                return view
+            end
+            continue
+        end
         if match then return view end
+        if hasPrimary and container == primary then return view end
         unknown = unknown or view
     end
     if unknown then return unknown end
@@ -664,7 +688,7 @@ function FlightController:Go(ctx, goal, now, tolerance)
         self.Route = {}
         local horizontal = Vector3.new(goal.X-start.X, 0, goal.Z-start.Z).Magnitude
         local needsCruise = horizontal > 40
-        if not needsCruise and horizontal > 6 then
+        if not needsCruise and horizontal > 0.5 then
             local ok, obstacle = pcall(function()
                 local params = RaycastParams.new()
                 params.FilterType = Enum.RaycastFilterType.Exclude
@@ -700,7 +724,11 @@ function FlightController:Go(ctx, goal, now, tolerance)
         else self.Align.Position = goal; self.LastProgress, self.LastDistance = now, distance; return true end
     end
     if distance < self.LastDistance - 0.5 then self.LastProgress, self.LastDistance = now, distance end
-    if now - self.LastProgress > 10 then self:Stop(); return false, "FLIGHT_NO_PROGRESS: blocked or corrected; no position forcing" end
+    if now - self.LastProgress > 10 then
+        Hub:Trace("MOVE", "BLOCKED", string.format("segment=%d/%d distance=%.1f root=(%.1f,%.1f,%.1f) waypoint=(%.1f,%.1f,%.1f)",
+            self.RouteIndex,#self.Route,distance,ctx.Root.Position.X,ctx.Root.Position.Y,ctx.Root.Position.Z,waypoint.X,waypoint.Y,waypoint.Z))
+        self:Stop(); return false, "FLIGHT_NO_PROGRESS: blocked or corrected; no position forcing"
+    end
     if now - self.Started > Settings.MovementTimeout then self:Stop(); return false, "FLIGHT_TIMEOUT" end
     self.Align.Position = waypoint
     return false
@@ -884,6 +912,27 @@ QuestReceiver = {MaxAttempts = 3, ConfirmationWait = 10, Reach = 6}
 function QuestReceiver:Step(job, ctx, row, now)
     local level = LevelDetector:Get()
     if not level or level < row.MinLevel then job:Pause("QUEST_LEVEL_REQUIREMENT_CHANGED"); return false end
+    -- Re-read before touching movement: the tracker can arrive between ticks.
+    local observed = questView(row)
+    if observed and observed.Visible then
+        MovementController:Stop()
+        job:SetState("CHECKING", "Quest tracker visible; validating objective")
+        return false
+    end
+    -- Confirm a transmitted request while stationary. A drifting player must
+    -- not start another NPC flight before this confirmation window expires.
+    if job.Awaiting then
+        MovementController:Stop()
+        job:SetState("CHECKING", "Waiting for quest UI confirmation; reply=" .. tostring(job.LastServerResponse))
+        if now < job.Awaiting then return false end
+        job.Awaiting = nil
+        if job.QuestAttempts >= self.MaxAttempts then
+            job:Pause("QUEST_CONFIRMATION_TIMEOUT: attempts=" .. job.QuestAttempts .. "; reply=" .. tostring(job.LastServerResponse)
+                .. "; distance=" .. tostring(job.NPCDistance or "Unknown") .. "; quest=" .. row.Id)
+            return false
+        end
+        job.NextQuestAttempt = now + 2
+    end
     local position, mappingError = QuestSelector:NPCPosition(row)
     if not position then job:Pause(mappingError or "QUEST_NPC_POSITION_UNAVAILABLE"); return false end
     local npcs, live = Services.Workspace:FindFirstChild("NPCs"), nil
@@ -895,7 +944,7 @@ function QuestReceiver:Step(job, ctx, row, now)
     end
     local delta = ctx.Root.Position - position
     local flat = Vector3.new(delta.X, 0, delta.Z)
-    local approach = position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0,0,1)) * 3
+    local approach = position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0,0,1)) * (self.Reach - 1)
     if delta.Magnitude > self.Reach then
         job.NPCApproachPending, job.NPCSettledAt = true, nil
         local _, moveError = MovementController:Go(ctx, approach, now, 1.5)
@@ -924,17 +973,6 @@ function QuestReceiver:Step(job, ctx, row, now)
         job.NPCApproachPending, job.NPCSettledAt = nil, nil
     end
     if Jobs.Pending.action then job:SetState("CHECKING", "Quest request in flight"); return false end
-    if job.Awaiting then
-        job:SetState("CHECKING", "Waiting for quest UI confirmation; reply=" .. tostring(job.LastServerResponse))
-        if now < job.Awaiting then return false end
-        job.Awaiting = nil
-        if job.QuestAttempts >= self.MaxAttempts then
-            job:Pause("QUEST_CONFIRMATION_TIMEOUT: attempts=" .. job.QuestAttempts .. "; reply=" .. tostring(job.LastServerResponse)
-                .. "; distance=" .. string.format("%.1f",distance) .. "; quest=" .. row.Id)
-            return false
-        end
-        job.NextQuestAttempt = now + 2
-    end
     if now < (job.NextQuestAttempt or 0) then return false end
     local view = questView(row)
     if not view then job:Pause("QUEST_UI_UNREADABLE: receive quest manually then Resume"); return false end
@@ -1955,8 +1993,9 @@ end
 function UI:UpdateFloating()
     local hasImage = self.Reopen.Image ~= ""
     self.Floating.Visible = not self.Window.Visible or hasImage
-    self.Floating.Size = UDim2.fromOffset(self.Window.Visible and 56 or 110, 56)
+    self.Floating.Size = self.Window.Visible and UDim2.fromOffset(56,56) or UDim2.fromOffset(280,98)
     self.FloatingStop.Visible = not self.Window.Visible
+    if self.FloatingStatus then self.FloatingStatus.Visible = not self.Window.Visible end
     if self.StatusLabel then self:Layout() end
 end
 function Hub:SetLuffyImageAssetId(value)
@@ -2047,6 +2086,12 @@ function UI:Build()
     self.StatusLabel = label(self.Window, "IDLE", UDim2.new(0, 14, 1, -36), UDim2.new(1, -145, 0, 28), Palette.Muted, 11)
     button(self.Window, "STOP ALL", UDim2.new(1, -119, 1, -42), UDim2.fromOffset(105, 30), function() Hub:StopAll() end)
     self.Floating = make("Frame", self.Host, {Name = "CrimsonFloating", Position = UDim2.fromOffset(12, 110), Size = UDim2.fromOffset(110, 56), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, Active = true})
+    self.FloatingStatus = label(self.Floating,"IDLE",UDim2.fromOffset(0,60),UDim2.fromOffset(280,38),Palette.Text,11)
+    self.FloatingStatus.Name = "TaskStatus"
+    self.FloatingStatus.BackgroundColor3,self.FloatingStatus.BackgroundTransparency = Palette.Sidebar,0.1
+    self.FloatingStatus.Visible = false
+    self.FloatingStatus.TextTruncate = Enum.TextTruncate.AtEnd
+    rounded(self.FloatingStatus,6)
     local reopen = make("ImageButton", self.Floating, {Name = "LuffyToggle", Position = UDim2.fromOffset(1, 1), Size = UDim2.fromOffset(54, 54), Image = "", ScaleType = Enum.ScaleType.Fit, BackgroundColor3 = Palette.Sidebar, AutoButtonColor = true, BorderSizePixel = 0, ClipsDescendants = true})
     rounded(reopen, 12)
     make("UIStroke", reopen, {Color = Palette.Red, Thickness = 2})
@@ -2278,6 +2323,11 @@ function UI:Update(now)
     end
     local status = Manager:Status()
     self.StatusLabel.Text = status.State .. "  |  " .. status.Detail
+    if self.FloatingStatus then
+        self.FloatingStatus.Text = status.State .. " | " .. status.Detail
+        self.FloatingStatus.Visible = not self.Window.Visible
+        self.FloatingStatus.TextColor3 = (status.Paused or status.State=="ERROR") and Palette.Red or Palette.Text
+    end
     self.StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
     for name, tab in pairs(self.Tabs) do tab.BackgroundColor3 = name == self.ActiveTab and Palette.Red or Palette.Sidebar end
     for i = #self.Toasts, 1, -1 do if now >= self.Toasts[i].Expires then self.Toasts[i].Frame:Destroy(); table.remove(self.Toasts, i) end end
@@ -2360,5 +2410,5 @@ Hub:Connect(Services.RunService.Heartbeat, function()
     if now - lastUI >= 0.3 then lastUI = now; Hub:RefreshUI() end
 end)
 Hub:Debug("Version", Hub.Version)
-Hub:Log("Crimson Hub v2.0.2 QA ready. Official-game validation remains pending; Studio fixtures are isolated.")
+Hub:Log("Crimson Hub v2.0.3 QA ready. Official-game validation remains pending; Studio fixtures are isolated.")
 return Hub
