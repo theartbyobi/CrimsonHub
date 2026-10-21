@@ -1,10 +1,13 @@
 --!nocheck
--- CRIMSON HUB 1.0 | Independent source | No network code or external UI.
+-- CRIMSON HUB 1.1 | Independent source | No downloaded code or external UI.
 -- Live Blox Fruits / executor validation has NOT been performed.
 -- Source-observed schemas are revalidated at runtime. Never writes NPC health,
 -- quest progress, mastery, inventory, collision, hidden properties or hit packets.
 
-local Hub = {Version = "1.0", Destroyed = false, Connections = {}, Logs = {}, Components = {}}
+-- Upload the supplied Luffy PNG to Roblox, then put its real image asset ID here.
+-- Blank preserves the existing text opener; no unrelated image is substituted.
+local Config = {LuffyImageAssetId = "", Debug = true}
+local Hub = {Version = "1.1", Destroyed = false, Connections = {}, Logs = {}, Components = {}, DebugValues = {}}
 local Services = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "TweenService", "UserInputService", "RunService"}) do
     local ok, service = pcall(function() return game:GetService(name) end)
@@ -54,7 +57,47 @@ function Hub:Log(message, isError)
     if #self.Logs >= 50 then table.remove(self.Logs, 1) end
     table.insert(self.Logs, {Time = os.clock(), Message = message})
     if isError then self.LastError = message end
-    if UI then UI:Notify(message, isError) end
+    if isError then warn("[Crimson] " .. message) end
+    if UI then
+        local ok, err = pcall(function() UI:Notify(self:Explain(message), isError) end)
+        if not ok then warn("[Crimson] UI notification failed: " .. tostring(err)) end
+    end
+end
+function Hub:Debug(field, value)
+    value = tostring(value)
+    if not Config.Debug or self.DebugValues[field] == value then return end
+    self.DebugValues[field] = value
+    print("[Crimson] " .. field .. ": " .. value)
+end
+function Hub:Explain(message)
+    local code = tostring(message):match("^[A-Z_]+")
+    local text = {
+        NO_QUEST_FOR_LEVEL = "Chưa có quest hợp lệ cho level này. Gửi log level, Sea và Quest data.",
+        QUEST_NPC_MAPPING_MISSING = "Có quest nhưng chưa xác định được NPC từ dữ liệu game.",
+        QUEST_NPC_MAPPING_AMBIGUOUS = "Nhiều NPC trùng điều kiện quest; đã dừng để tránh nhận sai.",
+        AMBIGUOUS_QUEST_LEVEL = "Nhiều quest cùng level; chưa đủ dữ liệu chọn chính xác.",
+        QUEST_MODULES_MISSING = "Không tìm thấy Quests / GuideModule. Có thể dữ liệu game đã đổi.",
+        QUEST_NOT_CONFIRMED_AFTER_ = "Máy chủ chưa xác nhận nhận quest sau 3 lần thử.",
+        NO_MATCHING_TOOL = "Chưa có Tool Melee / Sword phù hợp. Kiểm tra Weapon và Backpack.",
+        TOOL_TYPE_UNVERIFIED = "Tool đã chọn chưa có loại Melee / Sword được xác minh; không tự kích hoạt.",
+        TOOL_CHANGED = "Bạn đã đổi vũ khí. Chọn Weapon rồi bật lại Auto Level.",
+        COMBAT_NO_PROGRESS = "Chưa quan sát thấy sát thương. Phương thức đánh có thể không được game chấp nhận.",
+        QUEST_UI_SCHEMA_CHANGED = "Không đọc được giao diện quest hiện tại của game.",
+        LEVEL_DATA_MISSING_OR_CHANGED = "Chưa đọc được Player.Data.Level hợp lệ.",
+        QUEST_NPC_NOT_LOADED = "NPC quest chưa tải sau thời gian chờ giới hạn.",
+        MOVEMENT_BLOCKED_OR_CORRECTED = "Di chuyển bị chặn hoặc bị máy chủ điều chỉnh.",
+    }
+    return text[code] and (text[code] .. "\n" .. tostring(message)) or tostring(message)
+end
+function Hub:RefreshUI()
+    if not UI or not UI.StatusLabel or self.UpdatingUI or self.Destroyed then return end
+    self.UpdatingUI = true
+    local ok, err = pcall(function() UI:Update(os.clock()) end)
+    self.UpdatingUI = false
+    if not ok and self.LastUIError ~= tostring(err) then
+        self.LastUIError = tostring(err)
+        warn("[Crimson] UI_UPDATE_FAILED: " .. tostring(err))
+    end
 end
 
 -- Pure functions are also exercised by the offline test runner.
@@ -71,31 +114,43 @@ function Logic.TitleMatches(title, target)
     return false
 end
 function Logic.Finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
+function Logic.Integer(value, minimum)
+    local number = type(value) == "number" and value or type(value) == "string" and tonumber(value) or nil
+    if Logic.Finite(number) and number % 1 == 0 and number >= (minimum or 0) then return number end
+    return nil
+end
 function Logic.Position(value)
     if typeof(value) == "CFrame" then value = value.Position end
     if typeof(value) == "Vector3" and Logic.Finite(value.X) and Logic.Finite(value.Y) and Logic.Finite(value.Z)
         and math.abs(value.X) < 10000000 and math.abs(value.Y) < 10000000 and math.abs(value.Z) < 10000000 then return value end
     return nil
 end
-function Logic.BuildDatabase(quests, guide)
+-- Only factual metadata is used for this tie-break, never copied coordinates.
+-- Sources and validation limits are listed in FIX_REPORT.md. Live quest data wins.
+local StarterBinding = {Group = "BanditQuest1", Index = 1, Target = "Bandit", NPC = "Bandit Quest Giver"}
+function Logic.QuestSea(level) return level >= 1500 and 3 or level >= 700 and 2 or 1 end
+function Logic.BuildDatabase(quests, guide, sea)
     if type(quests) ~= "table" or type(guide) ~= "table" or type(guide.Data) ~= "table"
         or type(guide.Data.NPCList) ~= "table" then return nil, "QUEST_SCHEMA_CHANGED" end
     local levels, npcs, rows, examined = {}, {}, {}, 0
+    local stats = {Examined = 0, Invalid = 0, OtherSea = 0, Unbound = 0, Ambiguous = 0}
     for _, npc in pairs(guide.Data.NPCList) do
         examined = examined + 1
         if examined > 1000 then return nil, "NPC_DATABASE_TOO_LARGE" end
         if type(npc) == "table" and type(npc.NPCName) == "string" and type(npc.Levels) == "table" then
             local pos = Logic.Position(npc.Position)
-            if pos then
-                local record = {Name = npc.NPCName, Position = pos}
+            do
+                local record = {Name = npc.NPCName, Position = pos, Levels = {}}
                 table.insert(npcs, record)
-                for _, level in pairs(npc.Levels) do
-                    if Logic.Finite(level) and level >= 0 then
+                for _, value in pairs(npc.Levels) do
+                    local level = Logic.Integer(value, 0)
+                    if level then
+                        record.Levels[level] = true
                         levels[level] = levels[level] or {}
                         -- Duplicate entries for the same NPC do not create false ambiguity.
                         local duplicate = false
                         for _, previous in ipairs(levels[level]) do
-                            if previous.Name == record.Name and (previous.Position - pos).Magnitude < 1 then duplicate = true end
+                            if previous.Name == record.Name and (previous.Position == pos or previous.Position and pos and (previous.Position - pos).Magnitude < 1) then duplicate = true end
                         end
                         if not duplicate then table.insert(levels[level], record) end
                     end
@@ -109,43 +164,87 @@ function Logic.BuildDatabase(quests, guide)
             for index, row in pairs(entries) do
                 examined = examined + 1
                 if examined > 4000 then return nil, "QUEST_DATABASE_TOO_LARGE" end
-                if type(index) == "number" and index >= 1 and index % 1 == 0 and type(row) == "table"
-                    and Logic.Finite(row.LevelReq) and row.LevelReq >= 0 and type(row.Task) == "table" then
+                local questIndex = Logic.Integer(index, 1)
+                local minLevel = type(row) == "table" and Logic.Integer(row.LevelReq, 0)
+                stats.Examined = stats.Examined + 1
+                if questIndex and minLevel and type(row.Task) == "table" then
                     local target, amount, count
                     count = 0
                     for enemy, quantity in pairs(row.Task) do target, amount, count = enemy, quantity, count + 1 end
-                    -- Only ordinary single-species multi-kill quests. No boss/story guesses.
-                    local candidates = levels[row.LevelReq]
-                    if count == 1 and type(target) == "string" and Logic.Finite(amount) and amount > 1
-                        and amount % 1 == 0 and candidates and #candidates == 1 then
+                    amount = Logic.Integer(amount, 2)
+                    -- These story/training exclusions are observed in the referenced schema.
+                    local excluded = row.Name == "Trainees" or row.Name == "Swan's Raid" or row.Name == "Town Raid"
+                    if count == 1 and type(target) == "string" and target ~= "" and amount and not excluded then
+                        if sea and Logic.QuestSea(minLevel) ~= sea then stats.OtherSea = stats.OtherSea + 1; continue end
                         table.insert(rows, {
-                            Id = group .. ":" .. index, Group = group, Index = index,
-                            MinLevel = row.LevelReq, Target = target, Amount = amount,
-                            NPC = candidates[1].Name, Position = candidates[1].Position,
+                            Id = group .. ":" .. questIndex, Group = group, Index = questIndex,
+                            MinLevel = minLevel, Target = target, Amount = amount, Sea = sea,
+                            MaxLevel = Logic.Integer(row.MaxLevel, minLevel),
                         })
-                    end
-                end
+                    else stats.Invalid = stats.Invalid + 1 end
+                else stats.Invalid = stats.Invalid + 1 end
             end
         end
     end
-    if #rows == 0 then return nil, "NO_UNAMBIGUOUS_QUESTS" end
+    if #rows == 0 then return nil, "NO_SUPPORTED_LEVEL_QUESTS" end
     table.sort(rows, function(a, b)
         if a.MinLevel == b.MinLevel then return a.Id < b.Id end
         return a.MinLevel > b.MinLevel
     end)
-    return {Rows = rows, NPCs = npcs}
-end
-function Logic.SelectQuest(rows, level)
-    local selected
     for _, row in ipairs(rows) do
-        if row.MinLevel <= level then
-            if selected and row.MinLevel == selected.MinLevel and row.Id ~= selected.Id then
-                return nil, "AMBIGUOUS_QUEST_LEVEL"
+        local candidates = levels[row.MinLevel] or {}
+        -- Starter guides may represent the first quest as 0 or 1. Only this
+        -- source-observed quest/NPC identity permits that alias.
+        if row.Group == StarterBinding.Group and row.Index == StarterBinding.Index
+            and row.Target == StarterBinding.Target and row.MinLevel <= 1 then
+            for _, npc in ipairs(npcs) do
+                if Logic.Canonical(npc.Name) == Logic.Canonical(StarterBinding.NPC)
+                    and (npc.Levels[0] or npc.Levels[1]) then candidates = {npc}; break end
             end
-            if not selected then selected = row elseif row.MinLevel < selected.MinLevel then break end
+        end
+        if #candidates > 1 then
+            -- Match all ordinary thresholds in the same quest group. Do not use
+            -- proximity as evidence that an unrelated NPC owns the quest.
+            local matching = {}
+            for _, npc in ipairs(candidates) do
+                local matches = true
+                for _, sibling in ipairs(rows) do
+                    if sibling.Group == row.Group and not npc.Levels[sibling.MinLevel] then matches = false; break end
+                end
+                if matches then table.insert(matching, npc) end
+            end
+            if #matching > 0 then candidates = matching end
+        end
+        row.Candidates = candidates
+        if #candidates == 1 then row.NPC, row.Position = candidates[1].Name, candidates[1].Position
+        elseif #candidates == 0 then row.NPCError = "QUEST_NPC_MAPPING_MISSING"; stats.Unbound = stats.Unbound + 1
+        else row.NPCError = "QUEST_NPC_MAPPING_AMBIGUOUS"; stats.Ambiguous = stats.Ambiguous + 1 end
+        -- Preserve missing/ambiguous bindings as selection barriers, rather than
+        -- silently dropping their level and falling back to an older quest.
+        for i = #rows, 1, -1 do
+            if rows[i].MinLevel > row.MinLevel then
+                row.MaxLevel = math.min(row.MaxLevel or math.huge, rows[i].MinLevel - 1); break
+            end
         end
     end
-    if selected then return selected end
+    return {Rows = rows, NPCs = npcs, Stats = stats, Sea = sea}
+end
+function Logic.SelectQuest(rows, level)
+    level = Logic.Integer(level, 1)
+    if not level then return nil, "INVALID_PLAYER_LEVEL" end
+    local selected
+    for _, row in ipairs(rows) do
+        if row.MinLevel <= level and (not row.MaxLevel or level <= row.MaxLevel)
+            and (not selected or row.MinLevel > selected.MinLevel) then selected = row end
+    end
+    if selected then
+        for _, row in ipairs(rows) do
+            if row.Id ~= selected.Id and row.MinLevel == selected.MinLevel and (not row.MaxLevel or level <= row.MaxLevel) then
+                return nil, "AMBIGUOUS_QUEST_LEVEL"
+            end
+        end
+        return selected
+    end
     return nil, "NO_QUEST_FOR_LEVEL"
 end
 Hub.Components.Logic = Logic
@@ -156,8 +255,12 @@ local LevelDetector = {}
 function LevelDetector:Get()
     local data = Player:FindFirstChild("Data")
     local level = data and data:FindFirstChild("Level")
-    if level and (level:IsA("IntValue") or level:IsA("NumberValue")) and Logic.Finite(level.Value) then return level.Value end
-    return nil
+    if not level then return nil, "LEVEL_DATA_LOADING" end
+    if level:IsA("IntValue") or level:IsA("NumberValue") or level:IsA("StringValue") then
+        local number = Logic.Integer(level.Value, 1)
+        if number then return number end
+    end
+    return nil, "LEVEL_DATA_MISSING_OR_CHANGED"
 end
 function LevelDetector:Beli()
     local data = Player:FindFirstChild("Data")
@@ -232,7 +335,7 @@ function Jobs:Step(now)
     end
 end
 
-local QuestDatabase = {Status = "NOT_LOADED", Rows = {}, NPCs = {}, Error = nil}
+local QuestDatabase = {Status = "NOT_LOADED", Rows = {}, NPCs = {}, Error = nil, Stats = {}}
 function QuestDatabase:Load()
     if self.Status == "LOADING" then return end
     local quests, guide = Services.ReplicatedStorage:FindFirstChild("Quests"), Services.ReplicatedStorage:FindFirstChild("GuideModule")
@@ -242,19 +345,45 @@ function QuestDatabase:Load()
     self.Status, self.Error = "LOADING", nil
     local started = Jobs:Start("database", function()
         local q, g = require(quests), require(guide)
-        local result, err = Logic.BuildDatabase(q, g)
+        local result, err = Logic.BuildDatabase(q, g, SeaDetector:Get())
         if not result then error(err, 0) end
         return result
     end, 10, function(ok, result)
         if ok then
-            self.Rows, self.NPCs, self.Status = result.Rows, result.NPCs, "READY"
-            Hub:Log("Quest data ready: " .. #self.Rows .. " validated rows")
+            self.Rows, self.NPCs, self.Stats, self.Sea, self.Status = result.Rows, result.NPCs, result.Stats, result.Sea, "READY"
+            local low, high = self.Rows[#self.Rows].MinLevel, self.Rows[1].MinLevel
+            Hub:Debug("Quest data", #self.Rows .. " rows; thresholds " .. low .. ".." .. high
+                .. "; unbound=" .. self.Stats.Unbound .. "; ambiguous=" .. self.Stats.Ambiguous .. "; otherSea=" .. self.Stats.OtherSea)
+            Hub:Log("Quest data ready: " .. #self.Rows .. " server rows; NPC binding is checked separately")
         else self.Status, self.Error = "ERROR", tostring(result); Hub:Log(self.Error, true) end
     end)
     if not started then self.Status, self.Error = "ERROR", "ASYNC_UNAVAILABLE" end
 end
 local QuestSelector = {}
 function QuestSelector:Select(level) return Logic.SelectQuest(QuestDatabase.Rows, level) end
+function QuestSelector:NPCPosition(row)
+    if row.NPCError then return nil, row.NPCError .. ": " .. row.Id end
+    if type(row.NPC) ~= "string" then return nil, "QUEST_NPC_MAPPING_MISSING: " .. row.Id end
+    local folder = Services.Workspace:FindFirstChild("NPCs")
+    local found, score, count = nil, nil, 0
+    if folder then
+        for _, npc in ipairs(folder:GetChildren()) do
+            if Logic.Canonical(npc.Name) == Logic.Canonical(row.NPC) then
+                local position = pointOf(npc)
+                if position then
+                    count = count + 1
+                    local distance = row.Position and (position - row.Position).Magnitude or 0
+                    if not score or distance < score then found, score = position, distance end
+                end
+            end
+        end
+    end
+    if count > 1 and not row.Position then return nil, "QUEST_NPC_MAPPING_AMBIGUOUS: " .. row.NPC end
+    if found then return found end
+    local position = Logic.Position(row.Position)
+    if position then return position end
+    return nil, "QUEST_NPC_POSITION_UNAVAILABLE"
+end
 function QuestSelector:FromTitle(title, level)
     local match
     for _, row in ipairs(QuestDatabase.Rows) do
@@ -370,21 +499,35 @@ function MovementController:Go(ctx, goal, now, tolerance)
     return false
 end
 
-local CombatController = {Attempts = 0}
+local CombatController = {Attempts = 0, MetadataWarnings = setmetatable({}, {__mode = "k"})}
 function CombatController:Tools(kind)
     local result, seen = {}, {}
     local backpack = Player:FindFirstChildOfClass("Backpack")
     for _, holder in ipairs({Player.Character or false, backpack or false}) do
         if holder then
-            for _, tool in ipairs(holder:GetChildren()) do
-                local permitted = kind and tool.ToolTip == kind or not kind and (tool.ToolTip == "Melee" or tool.ToolTip == "Sword")
-                if tool:IsA("Tool") and permitted and not seen[tool.Name] then
-                    seen[tool.Name] = true; table.insert(result, tool)
+            for _, object in ipairs(holder:GetChildren()) do
+                -- ToolTip belongs to Tool. Never inspect it on character Parts.
+                if object:IsA("Tool") then
+                    local ok, name, tooltip = pcall(function() return object.Name, object.ToolTip end)
+                    if ok and (not kind or tooltip == kind) and not seen[name] then
+                        self.MetadataWarnings[object] = nil
+                        seen[name] = true; table.insert(result, object)
+                    elseif not ok and not self.MetadataWarnings[object] then
+                        self.MetadataWarnings[object] = true
+                        Hub:Log("TOOL_METADATA_UNREADABLE: " .. tostring(name):sub(1, 100), true)
+                    end
                 end
             end
         end
     end
     table.sort(result, function(a, b) return a.Name < b.Name end)
+    return result
+end
+function CombatController:UsableTools(kind)
+    local result = {}
+    for _, tool in ipairs(self:Tools(kind)) do
+        if kind or tool.ToolTip == "Melee" or tool.ToolTip == "Sword" then table.insert(result, tool) end
+    end
     return result
 end
 function CombatController:Stop()
@@ -405,9 +548,14 @@ function CombatController:Tick(ctx, target, now, kind)
     if not self.Tool then
         local selected
         if Settings.Weapon ~= "" then
-            for _, tool in ipairs(self:Tools(kind)) do if tool.Name == Settings.Weapon then selected = tool; break end end
+            for _, tool in ipairs(self:UsableTools(kind)) do if tool.Name == Settings.Weapon then selected = tool; break end end
+            if not selected and not kind then
+                for _, tool in ipairs(self:Tools()) do
+                    if tool.Name == Settings.Weapon then return false, "TOOL_TYPE_UNVERIFIED: " .. tool.Name .. " (" .. tool.ToolTip .. ")" end
+                end
+            end
         elseif equipped and (kind and equipped.ToolTip == kind or not kind and (equipped.ToolTip == "Melee" or equipped.ToolTip == "Sword")) then selected = equipped
-        elseif Settings.AutoEquip then selected = self:Tools(kind)[1] end
+        elseif Settings.AutoEquip then selected = self:UsableTools(kind)[1] end
         if not selected then return false, "NO_MATCHING_TOOL" end
         if selected ~= equipped then
             if not Settings.AutoEquip then return false, "EQUIP_SELECTED_TOOL_FIRST" end
@@ -444,6 +592,38 @@ function CombatController:Tick(ctx, target, now, kind)
     return true
 end
 
+-- Event listeners are replaced on respawn/backpack replacement, never appended
+-- to the global connection list on every equip. Polling also catches metadata edits.
+local InventoryController = {Connections = {}, Revision = 0, Signature = "", NextPoll = 0}
+function InventoryController:Changed() self.Revision = self.Revision + 1 end
+function InventoryController:Cleanup()
+    for _, connection in ipairs(self.Connections) do connection:Disconnect() end
+    self.Connections = {}
+end
+function InventoryController:Bind()
+    self:Cleanup()
+    for _, holder in ipairs({Player.Character or false, Player:FindFirstChildOfClass("Backpack") or false}) do
+        if holder then
+            for _, event in ipairs({holder.ChildAdded, holder.ChildRemoved}) do
+                table.insert(self.Connections, event:Connect(function(object)
+                    if object:IsA("Tool") then self:Changed() end
+                end))
+            end
+        end
+    end
+    self:Changed()
+end
+function InventoryController:Step(now)
+    if now < self.NextPoll then return end
+    self.NextPoll = now + 0.5
+    local names = {}
+    for _, tool in ipairs(CombatController:Tools()) do
+        table.insert(names, tool.Name .. "\0" .. tool.ToolTip .. "\0" .. (tool.Parent == Player.Character and "equipped" or "backpack"))
+    end
+    local signature = table.concat(names, "\1")
+    if signature ~= self.Signature then self.Signature = signature; self:Changed() end
+end
+
 local RecoveryController = {}
 function RecoveryController:Check(job, now)
     local ctx = characterContext()
@@ -464,7 +644,8 @@ function FarmController:SetState(state, detail) self.State, self.Detail = state,
 function FarmController:Start()
     self:Cleanup()
     self.Running, self.Started, self.State, self.Detail = true, os.clock(), "CHECKING", "Checking live data"
-    if self.Mode ~= "boss" and QuestDatabase.Status == "NOT_LOADED" then QuestDatabase:Load() end
+    Hub.DebugValues = {}
+    if self.Mode ~= "boss" and QuestDatabase.Status ~= "READY" and QuestDatabase.Status ~= "LOADING" then QuestDatabase:Load() end
     return true
 end
 function FarmController:Stop(reason)
@@ -479,10 +660,10 @@ function FarmController:Cleanup()
     Jobs:Cancel("action"); MovementController:Stop(); CombatController:Stop()
     self.Target, self.Quest, self.Awaiting, self.QuestAttempts, self.NoTargetSince, self.UIWait, self.QuestText = nil, nil, nil, 0, nil, nil, nil
     self.EncounterTarget, self.EncounterProgress, self.EncounterHealth = nil, nil, nil
-    self.RecoverySince, self.HakiAttempted, self.NPCWait, self.Until = nil, false, nil, nil
+    self.RecoverySince, self.HakiAttempted, self.NPCWait, self.Until, self.LevelWait = nil, false, nil, nil, nil
 end
 function FarmController:Fail(message)
-    self:Stop(message); self:SetState("ERROR", message); Hub:Log(message, true)
+    self:Stop(message); self:SetState("ERROR", message); Hub:Log(message, true); Hub:RefreshUI()
 end
 function FarmController:Respawn()
     local running = self.Running
@@ -502,6 +683,7 @@ function FarmController:PrepareQuest(ctx, level, now)
         return false
     end
     self.UIWait = nil
+    Hub:Debug("Quest Status", view.Visible and view.Text or "No active quest")
     if view.Visible then
         local previous = self.Quest
         if not self.Quest or not Logic.TitleMatches(view.Text, self.Quest.Target) then
@@ -514,6 +696,8 @@ function FarmController:PrepareQuest(ctx, level, now)
         end
         self.Awaiting, self.QuestAttempts, self.NPCWait = nil, 0, nil
         self.QuestText = view.Text
+        Hub:Debug("Selected Quest", self.Quest.Id)
+        Hub:Debug("Target Mob", self.Quest.Target)
         return true
     end
     self.QuestText = view.Text
@@ -527,9 +711,16 @@ function FarmController:PrepareQuest(ctx, level, now)
     CombatController:Stop(); self.Target = nil
     self:SetState("SELECTING_QUEST", "Selecting from validated quest data")
     local row, err = QuestSelector:Select(level)
-    if not row then self:Fail(err); return false end
+    if not row then
+        Hub:Debug("Selected Quest", "none (" .. err .. ")")
+        self:Fail(err .. ": level=" .. level .. ", sea=" .. tostring(SeaDetector:Get()) .. ", rows=" .. #QuestDatabase.Rows); return false
+    end
     self.Quest = row
-    local arrived, moveError = MovementController:Go(ctx, row.Position, now, 10)
+    Hub:Debug("Selected Quest", row.Id .. " [" .. row.MinLevel .. ".." .. tostring(row.MaxLevel or "open") .. "]")
+    Hub:Debug("Target Mob", row.Target)
+    local npcPosition, bindingError = QuestSelector:NPCPosition(row)
+    if not npcPosition then self:Fail(bindingError or "QUEST_NPC_POSITION_UNAVAILABLE"); return false end
+    local arrived, moveError = MovementController:Go(ctx, npcPosition, now, 10)
     if moveError then self:Fail(moveError); return false end
     if not arrived then self:SetState("MOVING", "Quest NPC: " .. row.NPC); return false end
     local npcs, found = Services.Workspace:FindFirstChild("NPCs"), false
@@ -537,7 +728,7 @@ function FarmController:PrepareQuest(ctx, level, now)
         for _, npc in ipairs(npcs:GetChildren()) do
             if Logic.Canonical(npc.Name) == Logic.Canonical(row.NPC) then
                 local pos = pointOf(npc)
-                if pos and (pos - row.Position).Magnitude <= 40 then found = true; break end
+                if pos and (pos - npcPosition).Magnitude <= 40 then found = true; break end
             end
         end
     end
@@ -563,9 +754,20 @@ function FarmController:Step(now)
     if not self.Running then return end
     local ctx = RecoveryController:Check(self, now)
     if not ctx then return end
-    if not SeaDetector:Get() then self:Fail("UNKNOWN_SEA: unsupported place ID"); return end
-    local level = LevelDetector:Get()
-    if not level then self:Fail("LEVEL_DATA_MISSING_OR_CHANGED"); return end
+    local sea = SeaDetector:Get()
+    Hub:Debug("Current Sea", sea or ("unknown place " .. tostring(game.PlaceId)))
+    if not sea then self:Fail("UNKNOWN_SEA: unsupported place ID"); return end
+    local level, levelError = LevelDetector:Get()
+    Hub:Debug("Player Level", level or "unreadable")
+    if not level then
+        if levelError == "LEVEL_DATA_LOADING" then
+            self.LevelWait = self.LevelWait or now
+            self:SetState("RECOVERING", "Waiting for Player.Data.Level")
+            if now - self.LevelWait > 12 then self:Fail("LEVEL_DATA_MISSING_OR_CHANGED: 12s timeout") end
+        else self:Fail(levelError) end
+        return
+    end
+    self.LevelWait = nil
     local name, kind
     if self.Mode == "boss" then
         name = Settings.Boss
@@ -823,11 +1025,13 @@ function Manager:Start(name)
     local ok, result = pcall(function() return job:Start() end)
     if not ok then job:Fail(tostring(result)); return false end
     if Settings.MinimizeOnStart and UI then UI:Minimize() end
+    Hub:RefreshUI()
     return job:IsRunning()
 end
 function Manager:StopAll(reason)
     for _, job in pairs(self.Tasks) do job:Stop(reason or "Stopped by user") end
     Jobs:Cancel("action"); MovementController:Stop(); CombatController:Stop()
+    Hub:RefreshUI()
 end
 function Manager:Step(now)
     if self.Active and self.Active:IsRunning() then
@@ -844,10 +1048,11 @@ Hub.Components.QuestDatabase, Hub.Components.QuestSelector = QuestDatabase, Ques
 Hub.Components.TargetManager, Hub.Components.MovementController = TargetManager, MovementController
 Hub.Components.CombatController, Hub.Components.RecoveryController = CombatController, RecoveryController
 Hub.Components.Jobs, Hub.Components.Observer = Jobs, Observer
+Hub.Components.InventoryController = InventoryController
 Hub.TaskManager = Manager
 
--- Native Roblox UI. This section has no downloaded libraries, fonts or images.
-UI = {Bindings = {}, Pages = {}, Tabs = {}, Toasts = {}, Cards = {}, ActiveTab = "Dashboard"}
+-- Native Roblox UI; no downloaded code/library. Optional art uses a Roblox asset ID.
+UI = {Bindings = {}, Pages = {}, Tabs = {}, Toasts = {}, Cards = {}, Toggles = {}, Dropdowns = {}, Canvases = {}, ActiveTab = "Dashboard"}
 local Palette = {
     Background = Color3.fromRGB(9, 9, 9), Sidebar = Color3.fromRGB(18, 18, 18),
     Panel = Color3.fromRGB(27, 27, 27), Red = Color3.fromRGB(225, 29, 46),
@@ -889,6 +1094,21 @@ local function button(parent, text, pos, size, callback, subtle)
     return b
 end
 function UI:Bind(callback) table.insert(self.Bindings, callback) end
+function UI:TrackCanvas(scroll, layout, horizontal, extra)
+    table.insert(self.Canvases, {Scroll = scroll, Layout = layout, Horizontal = horizontal, Extra = extra or 0})
+    scroll.Active, scroll.ScrollingEnabled, scroll.ClipsDescendants = true, true, true
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.None
+end
+function UI:UpdateCanvases()
+    for _, binding in ipairs(self.Canvases) do
+        if binding.Scroll.Parent and binding.Layout.Parent then
+            local horizontal = type(binding.Horizontal) == "function" and binding.Horizontal() or binding.Horizontal == true
+            local size = binding.Layout.AbsoluteContentSize
+            binding.Scroll.ScrollingDirection = horizontal and Enum.ScrollingDirection.X or Enum.ScrollingDirection.Y
+            binding.Scroll.CanvasSize = horizontal and UDim2.fromOffset(size.X + binding.Extra, 0) or UDim2.fromOffset(0, size.Y + binding.Extra)
+        end
+    end
+end
 function UI:Notify(message, isError)
     if not self.Host then return end
     if #self.Toasts >= 3 then self.Toasts[1].Frame:Destroy(); table.remove(self.Toasts, 1) end
@@ -918,13 +1138,17 @@ end
 function UI:Toggle(page, title, description, getter, setter)
     local frame = self:Card(page, title, description, 106)
     frame:FindFirstChildOfClass("TextLabel").Size = UDim2.new(1, -86, 0, 22)
-    local track = button(frame, "", UDim2.new(1, -65, 0, 11), UDim2.fromOffset(50, 24), function() setter(not getter()) end, true)
+    local track = button(frame, "", UDim2.new(1, -65, 0, 11), UDim2.fromOffset(50, 24), function() setter(not getter()); Hub:RefreshUI() end, true)
+    track.Name = "Toggle_" .. title
     rounded(track, 12)
     local knob = make("Frame", track, {Size = UDim2.fromOffset(18, 18), Position = UDim2.fromOffset(3, 3), BackgroundColor3 = Palette.Text, BorderSizePixel = 0})
     rounded(knob, 9)
     local previous, tween
+    local record = {Control = track, Knob = knob, Value = false}
+    self.Toggles[title] = record
     self:Bind(function()
         local value = getter() == true
+        record.Value = value
         track.BackgroundColor3 = value and Palette.Red or Palette.Border
         if value ~= previous then
             previous = value
@@ -963,51 +1187,120 @@ function UI:Slider(page, title, key, low, high, step, description)
 end
 function UI:Dropdown(page, title, description, key, provider, allowAuto)
     local frame = self:Card(page, title, description, 142)
-    local list, open = nil, false
-    local control
+    local record = {Frame = frame, Open = false, Items = {}, Revision = -1}
+    self.Dropdowns[key] = record
+    local control, list, search
     local function close()
-        open = false
-        if list then list:Destroy(); list = nil end
+        record.Open = false
+        if list then list.Visible = false; search.Visible = false end
         frame.Size = UDim2.new(1, -6, 0, 142)
+        control.Position = UDim2.new(0, 13, 1, -45)
     end
-    control = button(frame, "", UDim2.new(0, 13, 1, -45), UDim2.new(1, -26, 0, 32), function()
-        if open then close(); return end
-        open = true
-        control.Position = UDim2.fromOffset(13, 97)
-        frame.Size = UDim2.new(1, -6, 0, 338)
-        list = make("ScrollingFrame", frame, {Position = UDim2.fromOffset(13, 140), Size = UDim2.new(1, -26, 0, 184), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y})
-        rounded(list, 6)
-        make("UIListLayout", list, {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder})
+    record.Close = close
+    local function refresh()
+        -- Obtain options first: a provider failure leaves the previous usable menu intact.
         local options = provider()
-        if allowAuto then table.insert(options, 1, {Label = "Auto / equipped tool", Value = ""}) end
-        if #options == 0 then label(list, "No loaded options", UDim2.fromOffset(8, 8), UDim2.new(1, -16, 0, 28), Palette.Muted, 12) end
+        if type(options) ~= "table" then error("DROPDOWN_INVALID_OPTIONS: " .. key) end
+        for _, item in ipairs(record.Items) do item:Destroy() end
+        record.Items = {}
+        local query, matches = search.Text:lower(), 0
+        local function add(caption, value, informational)
+            local item
+            if informational then item = label(list, caption, UDim2.new(), UDim2.new(1, -10, 0, 36), Palette.Muted, 12)
+            else
+                item = button(list, caption, UDim2.new(), UDim2.new(1, -10, 0, 36), function()
+                    Manager:StopAll("Selection changed"); Settings[key] = value; close(); Hub:RefreshUI()
+                end, true)
+                item.TextTruncate = Enum.TextTruncate.AtEnd
+            end
+            item.LayoutOrder = #record.Items + 1
+            table.insert(record.Items, item)
+        end
+        if allowAuto then add("Auto / Equipped", "") end
         for _, option in ipairs(options) do
             local value, caption = option, option
             if type(option) == "table" then value, caption = option.Value, option.Label end
-            local item = button(list, tostring(caption), UDim2.new(), UDim2.new(1, -6, 0, 34), function()
-                Manager:StopAll("Selection changed")
-                Settings[key] = value; close()
-            end, true)
-            item.TextTruncate = Enum.TextTruncate.AtEnd
+            caption = tostring(caption)
+            if query == "" or caption:lower():find(query, 1, true) then matches = matches + 1; add(caption, value) end
         end
+        if matches == 0 then
+            add(key == "Weapon" and (#options == 0 and "No weapons found" or "No matching weapons") or "No loaded options", nil, true)
+        end
+        record.Revision = InventoryController.Revision
+        self:UpdateCanvases()
+    end
+    record.Refresh = refresh
+    control = button(frame, "", UDim2.new(0, 13, 1, -45), UDim2.new(1, -26, 0, 32), function()
+        if record.Open then close(); return end
+        if not list then
+            search = make("TextBox", frame, {Name = key .. "Search", Position = UDim2.fromOffset(13, 138), Size = UDim2.new(1, -26, 0, 30), PlaceholderText = "Search...", Text = "", ClearTextOnFocus = false, BackgroundColor3 = Palette.Sidebar, TextColor3 = Palette.Text, PlaceholderColor3 = Palette.Muted, TextSize = 12, Font = Enum.Font.Gotham, BorderSizePixel = 0, Visible = false})
+            list = make("ScrollingFrame", frame, {Name = key .. "Options", Position = UDim2.fromOffset(13, 174), Size = UDim2.new(1, -26, 0, 160), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, ScrollBarThickness = 6, CanvasSize = UDim2.new(), Visible = false})
+            rounded(search, 6); rounded(list, 6)
+            local layout = make("UIListLayout", list, {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder})
+            self:TrackCanvas(list, layout, false, 4)
+            record.List, record.Search = list, search
+            search:GetPropertyChangedSignal("Text"):Connect(function()
+                if record.Open then
+                    local ok, err = pcall(refresh)
+                    if not ok then Hub:Log("Dropdown search: " .. tostring(err), true) end
+                end
+            end)
+        end
+        refresh()
+        record.Open = true
+        control.Position = UDim2.fromOffset(13, 97)
+        local height = math.clamp(self.Pages[page].AbsoluteSize.Y - 170, 96, 184)
+        frame.Size, list.Size = UDim2.new(1, -6, 0, 186 + height), UDim2.new(1, -26, 0, height)
+        search.Visible, list.Visible = true, true
+        self:UpdateCanvases()
     end, true)
+    record.Control = control
     control.TextTruncate = Enum.TextTruncate.AtEnd
     self:Bind(function()
-        control.Text = (Settings[key] == "" and (allowAuto and "Auto / equipped tool" or "Select loaded option") or tostring(Settings[key])) .. "  v"
-        if not open then control.Position = UDim2.new(0, 13, 1, -45) end
+        control.Text = (Settings[key] == "" and (allowAuto and "Auto / Equipped" or "Select loaded option") or tostring(Settings[key])) .. "  v"
+        if record.Open and key == "Weapon" and record.Revision ~= InventoryController.Revision then refresh() end
+        if not record.Open then control.Position = UDim2.new(0, 13, 1, -45) end
     end)
 end
 function UI:TaskToggle(page, title, description, name)
     self:Toggle(page, title, description, function() return Manager.Tasks[name]:IsRunning() end, function(value)
-        if value then Manager:Start(name) else Manager.Tasks[name]:Stop("Stopped by user") end
+        if value then Manager:Start(name) elseif Manager.Active == Manager.Tasks[name] then Hub:StopAll() else Manager.Tasks[name]:Stop("Stopped by user") end
     end)
 end
-function UI:Minimize() self.Window.Visible, self.Floating.Visible = false, true end
-function UI:Show() self.Window.Visible, self.Floating.Visible = true, false end
+function Logic.ImageAsset(value)
+    local id = tostring(value or ""):match("^%s*(.-)%s*$")
+    if id == "" then return "" end
+    id = id:match("^rbxassetid://(%d+)$") or id
+    if not id:match("^%d+$") or not id:find("[1-9]") or #id > 20 then return nil end
+    return "rbxassetid://" .. id
+end
+function UI:UpdateFloating()
+    local hasImage = self.Reopen.Image ~= ""
+    self.Floating.Visible = not self.Window.Visible or hasImage
+    self.Floating.Size = UDim2.fromOffset(self.Window.Visible and 56 or 110, 56)
+    self.FloatingStop.Visible = not self.Window.Visible
+    if self.StatusLabel then self:Layout() end
+end
+function Hub:SetLuffyImageAssetId(value)
+    if self.Destroyed then return false, "HUB_UNLOADED" end
+    local imageId = Logic.ImageAsset(value)
+    if imageId == nil then return false, "INVALID_IMAGE_ASSET_ID" end
+    Config.LuffyImageAssetId = value
+    if UI and UI.Reopen then
+        UI.Reopen.Image = imageId
+        UI.ReopenFallback.Visible = imageId == ""
+        UI:UpdateFloating()
+    end
+    return true
+end
+function UI:Minimize() self.Window.Visible = false; self:UpdateFloating() end
+function UI:Show() self.Window.Visible = true; self:UpdateFloating() end
+function UI:ToggleWindow() if self.Window.Visible then self:Minimize() else self:Show() end end
 function UI:Layout()
     if not self.Host then return end
     local size = self.Host.AbsoluteSize
-    local w, h = math.max(280, math.min(820, size.X - 20)), math.max(240, math.min(610, size.Y - 20))
+    if size.X <= 0 or size.Y <= 0 then return end
+    local w, h = math.min(size.X, math.max(240, math.min(820, size.X - 20))), math.min(size.Y, math.max(200, math.min(610, size.Y - 20)))
     local compact = w < 610
     self.Window.Size = UDim2.fromOffset(w, h)
     local old = self.Window.Position
@@ -1016,13 +1309,20 @@ function UI:Layout()
     self.Nav.Position = UDim2.fromOffset(12, 64)
     self.Nav.Size = compact and UDim2.new(1, -24, 0, 40) or UDim2.new(0, 150, 1, -120)
     self.NavLayout.FillDirection = compact and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
-    self.Nav.AutomaticCanvasSize = compact and Enum.AutomaticSize.X or Enum.AutomaticSize.Y
+    self.Compact = compact
     for _, tab in pairs(self.Tabs) do tab.Size = compact and UDim2.fromOffset(122, 34) or UDim2.new(1, -6, 0, 36) end
     for _, page in pairs(self.Pages) do
         page.Position = compact and UDim2.fromOffset(12, 114) or UDim2.fromOffset(174, 64)
         page.Size = compact and UDim2.new(1, -24, 1, -166) or UDim2.new(1, -186, 1, -116)
     end
     self.StatusLabel.Size = UDim2.new(1, -145, 0, 28)
+    if not self.FloatingPlaced then
+        self.FloatingPlaced = true
+        self.Floating.Position = UDim2.fromOffset(math.max(0, size.X - 122), 76)
+    end
+    local floatingPos, floatingSize = self.Floating.Position, self.Floating.Size
+    self.Floating.Position = UDim2.fromOffset(math.clamp(floatingPos.X.Offset, 0, math.max(0, size.X - floatingSize.X.Offset)), math.clamp(floatingPos.Y.Offset, 0, math.max(0, size.Y - floatingSize.Y.Offset)))
+    self:UpdateCanvases()
 end
 function UI:Build()
     Screen = make("ScreenGui", PlayerGui, {Name = GUI_NAME, ResetOnSpawn = false, IgnoreGuiInset = false, DisplayOrder = 40, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
@@ -1035,17 +1335,19 @@ function UI:Build()
     rounded(self.Window, 13); stroke(self.Window)
     local header = make("Frame", self.Window, {Size = UDim2.new(1, 0, 0, 53), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, Active = true})
     label(header, "CRIMSON HUB", UDim2.fromOffset(16, 9), UDim2.new(1, -112, 0, 22), Palette.Text, 18)
-    label(header, "v1.0  |  runtime checks enabled", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
+    label(header, "v1.1  |  live test pending", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
     button(header, "_", UDim2.new(1, -83, 0, 10), UDim2.fromOffset(30, 30), function() self:Minimize() end, true)
     button(header, "X", UDim2.new(1, -44, 0, 10), UDim2.fromOffset(30, 30), function() Hub:Cleanup() end)
     self.Nav = make("ScrollingFrame", self.Window, {BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 2})
     rounded(self.Nav, 8)
     self.NavLayout = make("UIListLayout", self.Nav, {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder})
+    self:TrackCanvas(self.Nav, self.NavLayout, function() return self.Compact == true end, 8)
     local pages = {"Dashboard", "Auto Farm", "Mastery", "Boss", "Fruit & Chest", "Teleport", "Settings"}
     for index, name in ipairs(pages) do
         local page = make("ScrollingFrame", self.Window, {Name = name, Visible = name == "Dashboard", BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y})
         self.Pages[name] = page
-        make("UIListLayout", page, {Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder})
+        local layout = make("UIListLayout", page, {Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder})
+        self:TrackCanvas(page, layout, false, 16)
         make("UIPadding", page, {PaddingTop = UDim.new(0, 2), PaddingLeft = UDim.new(0, 2), PaddingBottom = UDim.new(0, 12)})
         local search = make("TextBox", page, {LayoutOrder = -1, Size = UDim2.new(1, -6, 0, 36), PlaceholderText = "Search controls...", Text = "", ClearTextOnFocus = false, BackgroundColor3 = Palette.Sidebar, TextColor3 = Palette.Text, PlaceholderColor3 = Palette.Muted, TextSize = 12, Font = Enum.Font.Gotham, BorderSizePixel = 0})
         rounded(search, 7)
@@ -1056,18 +1358,29 @@ function UI:Build()
         local tab = button(self.Nav, name, UDim2.new(), UDim2.fromOffset(144, 36), function()
             self.ActiveTab = name
             for n, content in pairs(self.Pages) do content.Visible = n == name end
+            if name == "Auto Farm" and self.Dropdowns.Weapon and self.Dropdowns.Weapon.Open then self.Dropdowns.Weapon.Refresh() end
+            Hub:RefreshUI()
         end, true)
         tab.LayoutOrder = index; self.Tabs[name] = tab
     end
     self.StatusLabel = label(self.Window, "IDLE", UDim2.new(0, 14, 1, -36), UDim2.new(1, -145, 0, 28), Palette.Muted, 11)
     button(self.Window, "STOP ALL", UDim2.new(1, -119, 1, -42), UDim2.fromOffset(105, 30), function() Hub:StopAll() end)
-    self.Floating = make("Frame", self.Host, {Position = UDim2.fromOffset(12, 100), Size = UDim2.fromOffset(146, 44), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, Visible = false, Active = true})
-    rounded(self.Floating, 10); stroke(self.Floating)
-    local reopen = button(self.Floating, "CRIMSON", UDim2.fromOffset(4, 4), UDim2.fromOffset(94, 36), function() self:Show() end, true)
-    button(self.Floating, "STOP", UDim2.fromOffset(101, 4), UDim2.fromOffset(41, 36), function() Hub:StopAll() end)
+    self.Floating = make("Frame", self.Host, {Name = "CrimsonFloating", Position = UDim2.fromOffset(12, 110), Size = UDim2.fromOffset(110, 56), BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, Active = true})
+    local reopen = make("ImageButton", self.Floating, {Name = "LuffyToggle", Position = UDim2.fromOffset(1, 1), Size = UDim2.fromOffset(54, 54), Image = "", ScaleType = Enum.ScaleType.Fit, BackgroundColor3 = Palette.Sidebar, AutoButtonColor = true, BorderSizePixel = 0, ClipsDescendants = true})
+    rounded(reopen, 12)
+    make("UIStroke", reopen, {Color = Palette.Red, Thickness = 2})
+    self.Reopen = reopen
+    self.ReopenFallback = label(reopen, "CRIMSON", UDim2.fromOffset(2, 17), UDim2.new(1, -4, 0, 20), Palette.Text, 9)
+    self.ReopenFallback.TextXAlignment = Enum.TextXAlignment.Center
+    self.FloatingStop = button(self.Floating, "STOP", UDim2.fromOffset(61, 9), UDim2.fromOffset(46, 38), function() Hub:StopAll() end)
+    reopen.Activated:Connect(function()
+        if Hub:IsAlive() and not self.FloatingDragged then self:ToggleWindow() end
+    end)
+    Hub:SetLuffyImageAssetId(Config.LuffyImageAssetId)
     local function drag(handle, target, main)
         handle.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                if not main then self.FloatingDragged = false end
                 self.Drag = {Input = input, Origin = input.Position, Position = target.Position, Target = target, Main = main}
             end
         end)
@@ -1081,7 +1394,9 @@ function UI:Build()
             local delta = input.Position - d.Origin
             local size, ts = self.Host.AbsoluteSize, d.Target.AbsoluteSize
             d.Target.Position = UDim2.fromOffset(math.clamp(d.Position.X.Offset + delta.X, 0, math.max(0, size.X - ts.X)), math.clamp(d.Position.Y.Offset + delta.Y, 0, math.max(0, size.Y - ts.Y)))
-            if d.Main then self.Dragged = true end
+            if delta.Magnitude > 6 then
+                if d.Main then self.Dragged = true else self.FloatingDragged = true end
+            end
         end
     end)
     Hub:Connect(Services.UserInputService.InputEnded, function(input)
@@ -1103,12 +1418,12 @@ function UI:Populate()
         local active = Manager.Active
         return s.State .. "  |  " .. (Manager.Name or "none") .. "\n" .. s.Detail .. "\nRuntime: " .. tostring(active and active.Running and math.floor(os.clock() - active.Started) or 0) .. "s"
     end, 128)
-    self:Info("Dashboard", "Current error", function() return Hub.LastError or "None" end, 124)
+    self:Info("Dashboard", "Current error", function() return Hub.LastError and Hub:Explain(Hub.LastError) or "None" end, 164)
     self:Info("Dashboard", "Validation scope", function()
         return "No live game/executor test performed. Data and progress are checked while running. A method call alone never proves quest, damage or pickup success."
     end, 146)
     self:TaskToggle("Auto Farm", "Auto Level", "Quest selection, NPC approach and monitored combat. Stops when required data or progress is missing.", "level")
-    self:Dropdown("Auto Farm", "Weapon", "Inventory is read when this menu opens. Manual changes during combat stop the task.", "Weapon", function()
+    self:Dropdown("Auto Farm", "Weapon", "Live Tools in Character + Backpack. Auto attacks use Melee / Sword; manual combat switches stop the task.", "Weapon", function()
         local names = {}; for _, tool in ipairs(CombatController:Tools()) do table.insert(names, tool.Name) end; return names
     end, true)
     self:Toggle("Auto Farm", "Auto equip tool", "Uses Humanoid:EquipTool once per combat session.", function() return Settings.AutoEquip end, function(v) Settings.AutoEquip = v; Manager:StopAll("Equipment settings changed") end)
@@ -1119,7 +1434,7 @@ function UI:Populate()
         local job = Manager.Active
         return "Database: " .. QuestDatabase.Status .. " (" .. #QuestDatabase.Rows .. " rows)\n" .. (job and job.QuestText or "No quest observation")
     end, 142)
-    self:Action("Auto Farm", "Quest data", "Reads only the game's replicated Quests and GuideModule. Ambiguous rows are excluded.", "Reload quest data", function()
+    self:Action("Auto Farm", "Quest data", "Reads Quests + GuideModule. Keeps valid quests and reports uncertain NPC bindings separately.", "Reload quest data", function()
         Manager:StopAll("Reloading quest data"); QuestDatabase:Load()
     end)
     self:TaskToggle("Mastery", "Melee mastery", "Runs the quest engine using a Tool whose ToolTip is Melee. Mastery credit remains server controlled.", "melee")
@@ -1153,6 +1468,10 @@ function UI:Populate()
     self:Dropdown("Settings", "Attack method", "Tool.Activate is the default. VirtualUser is optional and may be blocked by executor permissions.", "AttackMethod", function() return {"Tool.Activate", "VirtualUser (optional)"} end)
     self:Toggle("Settings", "Auto Haki", "Optional Buso request once per task/respawn. No success claim from the RPC return value.", function() return Settings.AutoHaki end, function(v) Settings.AutoHaki = v end)
     self:Toggle("Settings", "Minimize on Start", "The floating button can reopen the window or stop all work.", function() return Settings.MinimizeOnStart end, function(v) Settings.MinimizeOnStart = v end)
+    self:Info("Settings", "Luffy image", function()
+        return UI.Reopen.Image ~= "" and "Asset ID configured. Display still depends on Roblox asset access/moderation."
+            or "Chưa có Roblox Image Asset ID. Ảnh đính kèm nằm trong assets/Luffy_Gear5.png; xem README để cấu hình."
+    end, 126)
     self:Action("Settings", "Stop all tasks", "Cancels movement, combat, pending local jobs and item monitoring.", "STOP ALL", function() Hub:StopAll() end)
     self:Action("Settings", "Reset settings", "Stops all work and restores defaults for this session. No file APIs are used.", "Reset", function()
         Hub:StopAll(); for k, v in pairs(Defaults) do Settings[k] = v end; Hub.LastError = nil
@@ -1164,9 +1483,14 @@ function UI:Populate()
     self:Action("Settings", "Unload Hub", "Stops tasks, disconnects listeners and destroys the UI. Run the file again to reopen.", "Unload", function() Hub:Cleanup() end)
 end
 function UI:Update(now)
-    for _, binding in ipairs(self.Bindings) do
+    InventoryController:Step(now)
+    self.BindingErrors = self.BindingErrors or {}
+    for index, binding in ipairs(self.Bindings) do
         local ok, err = pcall(binding)
-        if not ok and not self.BindingError then self.BindingError = true; Hub:Log("UI update: " .. tostring(err):sub(1, 120), true) end
+        if not ok and self.BindingErrors[index] ~= tostring(err) then
+            self.BindingErrors[index] = tostring(err)
+            Hub:Log("UI_BINDING_ERROR[" .. index .. "]: " .. tostring(err):sub(1, 120), true)
+        elseif ok then self.BindingErrors[index] = nil end
     end
     local status = Manager:Status()
     self.StatusLabel.Text = status.State .. "  |  " .. status.Detail
@@ -1174,22 +1498,24 @@ function UI:Update(now)
     for name, tab in pairs(self.Tabs) do tab.BackgroundColor3 = name == self.ActiveTab and Palette.Red or Palette.Sidebar end
     for i = #self.Toasts, 1, -1 do if now >= self.Toasts[i].Expires then self.Toasts[i].Frame:Destroy(); table.remove(self.Toasts, i) end end
     for index, toast in ipairs(self.Toasts) do toast.Frame.Position = UDim2.new(1, -292, 1, -62 - index * 74) end
+    self:UpdateCanvases()
 end
 
 function Hub:Start(name) return Manager:Start(name or "level") end
 function Hub:StopAll()
     Manager:StopAll("Stopped by user"); Observer:Cleanup(); Jobs:CancelAll()
     if QuestDatabase.Status == "LOADING" then QuestDatabase.Status, QuestDatabase.Error = "NOT_LOADED", nil end
+    self:RefreshUI()
 end
 function Hub:GetStatus() return Manager:Status() end
 function Hub:Cleanup()
     if self.Destroyed then return end
     self.Destroyed = true
-    Manager:StopAll("Hub unloaded"); Observer:Cleanup(); Jobs:CancelAll()
+    Manager:StopAll("Hub unloaded"); Observer:Cleanup(); Jobs:CancelAll(); InventoryController:Cleanup()
     for _, connection in ipairs(self.Connections) do pcall(function() connection:Disconnect() end) end
     self.Connections = {}
     if Screen and Screen.Parent then Screen:Destroy() end
-    UI.Bindings, UI.Pages, UI.Tabs, UI.Cards, UI.Toasts = {}, {}, {}, {}, {}
+    UI.Bindings, UI.Pages, UI.Tabs, UI.Cards, UI.Toasts, UI.Dropdowns, UI.Toggles, UI.Canvases = {}, {}, {}, {}, {}, {}, {}, {}
     UI.Drag, UI.SliderDrag, UI.Host = nil, nil, nil
 end
 
@@ -1199,7 +1525,11 @@ if not built then
     Hub:Cleanup(); return
 end
 Hub.UI = UI
+InventoryController:Bind()
+Hub:Connect(Player.ChildAdded, function(object) if object:IsA("Backpack") then InventoryController:Bind() end end)
+Hub:Connect(Player.ChildRemoved, function(object) if object:IsA("Backpack") then InventoryController:Bind() end end)
 Hub:Connect(Player.CharacterAdded, function()
+    InventoryController:Bind()
     Jobs:Cancel("action"); MovementController:Stop(); CombatController:Stop()
     for _, job in pairs(Manager.Tasks) do if job:IsRunning() then job:Respawn() end end
 end)
@@ -1209,14 +1539,19 @@ Hub:Connect(Services.RunService.Heartbeat, function()
     local now = os.clock()
     if now - lastTick < 0.15 then return end
     lastTick = now
-    local ok, err = pcall(function()
-        Jobs:Step(now)
-        local demanded = Manager.Active and Manager.Active:IsRunning() and (Manager.Name == "fruit" or Manager.Name == "chest")
-        Observer:Step(now, demanded == true)
-        Manager:Step(now)
-        if now - lastUI >= 0.3 then lastUI = now; UI:Update(now) end
-    end)
-    if not ok then Hub:StopAll(); Hub:Log("SCHEDULER_STOPPED: " .. tostring(err):sub(1, 140), true) end
+    local ok, err = pcall(function() Jobs:Step(now) end)
+    if not ok then Hub:StopAll(); Hub:Log("ASYNC_SCHEDULER_ERROR: " .. tostring(err):sub(1, 140), true) end
+    local demanded = Manager.Active and Manager.Active:IsRunning() and (Manager.Name == "fruit" or Manager.Name == "chest")
+    local observerOK, observerError = pcall(function() Observer:Step(now, demanded == true) end)
+    if not observerOK then
+        Observer:Cleanup()
+        if demanded then Manager.Active:Fail("OBSERVER_ERROR: " .. tostring(observerError))
+        elseif not Observer.ReportedError then Observer.ReportedError = true; Hub:Log("OBSERVER_ERROR: " .. tostring(observerError), true) end
+    end
+    Manager:Step(now)
+    -- UI exceptions are isolated from movement/combat and never stop Auto Level.
+    if now - lastUI >= 0.3 then lastUI = now; Hub:RefreshUI() end
 end)
-Hub:Log("Ready. Select a weapon and movement method before starting.")
+Hub:Debug("Version", Hub.Version)
+Hub:Log("Crimson Hub v1.1 ready. Select Melee / Sword; live game validation is pending.")
 return Hub
