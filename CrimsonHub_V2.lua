@@ -1,5 +1,5 @@
 --!nocheck
--- CRIMSON HUB 2.0.1 | Independent source | No downloaded code or external UI.
+-- CRIMSON HUB 2.0.2 QA | Independent source | No downloaded code or external UI.
 -- Live Blox Fruits / executor validation has NOT been performed.
 -- Source-observed schemas are revalidated at runtime. Never writes NPC health,
 -- quest progress, mastery, inventory, collision, hidden properties or hit packets.
@@ -7,7 +7,7 @@
 -- Upload the supplied Luffy PNG to Roblox, then put its real image asset ID here.
 -- Blank preserves the existing text opener; no unrelated image is substituted.
 local Config = {LuffyImageAssetId = "", Debug = true}
-local Hub = {Version = "2.0.1", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
+local Hub = {Version = "2.0.2-qa", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
 local Services = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "TweenService", "UserInputService", "RunService"}) do
     local ok, service = pcall(function() return game:GetService(name) end)
@@ -312,7 +312,15 @@ function Logic.Summary(value)
 end
 
 local SeaDetector = {Places = {[2753915549] = 1, [4442272183] = 2, [7449423635] = 3}}
-function SeaDetector:Get() return self.Places[game.PlaceId] end
+function SeaDetector:Get()
+    -- Only the explicitly marked local Studio fixture can supply a test sea.
+    -- Published games and official Blox Fruits continue to use their PlaceId.
+    if Services.RunService:IsStudio() and Services.Workspace:GetAttribute("CrimsonStudioFixture") == true then
+        local sea = Services.Workspace:GetAttribute("CrimsonStudioSea")
+        if sea == 1 or sea == 2 or sea == 3 then return sea end
+    end
+    return self.Places[game.PlaceId]
+end
 local LevelDetector = {}
 function LevelDetector:Get()
     local data = Player:FindFirstChild("Data")
@@ -654,7 +662,22 @@ function FlightController:Go(ctx, goal, now, tolerance)
     if not self.Goal or (self.Goal - goal).Magnitude > 8 then
         local start = ctx.Root.Position
         self.Route = {}
-        if Vector3.new(goal.X-start.X, 0, goal.Z-start.Z).Magnitude > 40 then
+        local horizontal = Vector3.new(goal.X-start.X, 0, goal.Z-start.Z).Magnitude
+        local needsCruise = horizontal > 40
+        if not needsCruise and horizontal > 6 then
+            local ok, obstacle = pcall(function()
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {ctx.Character}
+                params.RespectCanCollide = true
+                return Services.Workspace:Blockcast(CFrame.new(start), Vector3.new(3.5,5,3.5), goal-start, params)
+            end)
+            if ok and obstacle then
+                needsCruise = true
+                Hub:Trace("MOVE", "CLEARANCE", "Collidable obstacle on short flight; ascending before crossing")
+            end
+        end
+        if needsCruise then
             local cruise = math.max(start.Y, goal.Y) + Settings.CruiseHeight
             table.insert(self.Route, Vector3.new(start.X, cruise, start.Z))
             table.insert(self.Route, Vector3.new(goal.X, cruise, goal.Z))
@@ -672,6 +695,8 @@ function FlightController:Go(ctx, goal, now, tolerance)
         if self.RouteIndex < #self.Route then
             self.RouteIndex = self.RouteIndex + 1; waypoint = self.Route[self.RouteIndex]
             self.LastProgress, self.LastDistance = now, math.huge
+            -- Measure the new segment before updating the progress baseline.
+            distance = (ctx.Root.Position - waypoint).Magnitude
         else self.Align.Position = goal; self.LastProgress, self.LastDistance = now, distance; return true end
     end
     if distance < self.LastDistance - 0.5 then self.LastProgress, self.LastDistance = now, distance end
@@ -872,6 +897,7 @@ function QuestReceiver:Step(job, ctx, row, now)
     local flat = Vector3.new(delta.X, 0, delta.Z)
     local approach = position + (flat.Magnitude > 0.1 and flat.Unit or Vector3.new(0,0,1)) * 3
     if delta.Magnitude > self.Reach then
+        job.NPCApproachPending, job.NPCSettledAt = true, nil
         local _, moveError = MovementController:Go(ctx, approach, now, 1.5)
         if moveError then job:Pause(moveError); return false end
         job:SetState("MOVING", "Fly to NPC: " .. tostring(row.NPC)); return false
@@ -888,6 +914,15 @@ function QuestReceiver:Step(job, ctx, row, now)
     local distance = actual and (ctx.Root.Position-actual).Magnitude
     job.NPCDistance = distance
     if not distance or distance > self.Reach then job:SetState("MOVING", "Closing NPC interaction distance"); return false end
+    -- Physics position replication can trail the client after a fast approach.
+    -- Release motion, remain in range, and allow the server to observe arrival.
+    if job.NPCApproachPending then
+        job.NPCSettledAt = job.NPCSettledAt or now
+        if now - job.NPCSettledAt < 0.5 then
+            job:SetState("CHECKING", "Waiting for NPC arrival to settle"); return false
+        end
+        job.NPCApproachPending, job.NPCSettledAt = nil, nil
+    end
     if Jobs.Pending.action then job:SetState("CHECKING", "Quest request in flight"); return false end
     if job.Awaiting then
         job:SetState("CHECKING", "Waiting for quest UI confirmation; reply=" .. tostring(job.LastServerResponse))
@@ -915,9 +950,17 @@ function QuestReceiver:Step(job, ctx, row, now)
     end, 8, function(ok, reply)
         if not job.Running then return end
         job.LastServerResponse = Logic.Summary(reply)
-        Hub:Trace("QUEST", "SERVER_REPLY", "StartQuest " .. row.Id, job.LastServerResponse, ok and nil or job.LastServerResponse)
+        Hub:Trace("QUEST", "SERVER_REPLY", "StartQuest " .. row.Id, job.LastServerResponse, not ok and job.LastServerResponse or nil)
         if not ok then job:Pause("QUEST_REQUEST_FAILED: " .. job.LastServerResponse)
-        elseif reply == false then job:Pause("QUEST_SERVER_REJECTED: false; check level/unlock/NPC in game")
+        elseif reply == false then
+            if job.QuestAttempts >= self.MaxAttempts then
+                job:Pause("QUEST_SERVER_REJECTED: false after " .. job.QuestAttempts .. " attempts; check level/unlock/NPC in game")
+            else
+                -- Arrival can still reach the server later than the request.
+                -- Recheck level, NPC range and tracker before every bounded retry.
+                job.NextQuestAttempt = os.clock() + 1.5
+                job:SetState("CHECKING", "Server declined quest; rechecking NPC before retry " .. (job.QuestAttempts + 1))
+            end
         else job.Awaiting = os.clock() + QuestReceiver.ConfirmationWait end
     end)
     if not started then job:Pause("ASYNC_UNAVAILABLE") end
@@ -972,6 +1015,7 @@ function FarmController:Cleanup()
     self.RecoverySince, self.HakiAttempted, self.NPCWait, self.Until, self.LevelWait = nil, false, nil, nil, nil
     self.ManagedQuestId, self.LastServerResponse, self.Progress, self.Switching, self.NextQuestAttempt = nil, nil, nil, nil, nil
     self.RequestedQuestId, self.CompletionSince, self.NPCDistance, self.CurrentIsland = nil, nil, nil, nil
+    self.NPCApproachPending, self.NPCSettledAt = nil, nil
 end
 function FarmController:Fail(message)
     self:Stop(message); self:SetState("ERROR", message); Hub:Log(message, true); Hub:RefreshUI()
@@ -1475,7 +1519,7 @@ function SeaProgression:Travel(sea)
         Hub:StopAll()
         local remote=commRemote(); if not remote then Hub:Log("COMM_REMOTE_MISSING_OR_CHANGED",true); return end
         Jobs:Start("sea",function() return remote:InvokeServer(names[sea]) end,10,function(ok,reply)
-            Hub:Trace("SEA","SERVER_REPLY",names[sea],Logic.Summary(reply),ok and nil or tostring(reply))
+            Hub:Trace("SEA","SERVER_REPLY",names[sea],Logic.Summary(reply),not ok and tostring(reply) or nil)
             Hub:Log("Sea travel reply: " .. Logic.Summary(reply) .. ". Only a new PlaceId confirms travel.",not ok)
         end)
     end)
@@ -1531,7 +1575,7 @@ function FruitService:Buy(row)
             local before=LevelDetector:Beli()
             local started=Jobs:Start("purchase",function() return remote:InvokeServer("PurchaseRawFruit",name) end,8,function(success,reply)
                 self.Pending=false
-                Hub:Trace("FRUIT","PURCHASE_REPLY",name .. "; Beli before=" .. tostring(before) .. "; after=" .. tostring(LevelDetector:Beli()),Logic.Summary(reply),success and nil or tostring(reply))
+                Hub:Trace("FRUIT","PURCHASE_REPLY",name .. "; Beli before=" .. tostring(before) .. "; after=" .. tostring(LevelDetector:Beli()),Logic.Summary(reply),not success and tostring(reply) or nil)
                 Hub:Log("Purchase reply: " .. Logic.Summary(reply) .. ". Verify the fruit and Beli in the game UI.",not success or reply==false)
             end)
             if not started then self.Pending=false; Hub:Log("PURCHASE_JOB_UNAVAILABLE",true) end
@@ -1860,8 +1904,8 @@ function UI:Dropdown(page, title, description, key, provider, allowAuto)
         self:UpdateCanvases()
     end
     record.Refresh = refresh
-    control = button(frame, "", UDim2.new(0, 13, 1, -45), UDim2.new(1, -26, 0, 32), function()
-        if record.Open then close(); return end
+    local function setOpen(value)
+        if not value then close(); return end
         if not list then
             search = make("TextBox", frame, {Name = key .. "Search", Position = UDim2.fromOffset(13, 138), Size = UDim2.new(1, -26, 0, 30), PlaceholderText = "Search...", Text = "", ClearTextOnFocus = false, BackgroundColor3 = Palette.Sidebar, TextColor3 = Palette.Text, PlaceholderColor3 = Palette.Muted, TextSize = 12, Font = Enum.Font.Gotham, BorderSizePixel = 0, Visible = false})
             list = make("ScrollingFrame", frame, {Name = key .. "Options", Position = UDim2.fromOffset(13, 174), Size = UDim2.new(1, -26, 0, 160), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, ScrollBarThickness = 6, CanvasSize = UDim2.new(), Visible = false})
@@ -1883,6 +1927,10 @@ function UI:Dropdown(page, title, description, key, provider, allowAuto)
         frame.Size, list.Size = UDim2.new(1, -6, 0, 186 + height), UDim2.new(1, -26, 0, height)
         search.Visible, list.Visible = true, true
         self:UpdateCanvases()
+    end
+    record.SetOpen = setOpen
+    control = button(frame, "", UDim2.new(0, 13, 1, -45), UDim2.new(1, -26, 0, 32), function()
+        setOpen(not record.Open)
     end, true)
     record.Control = control
     control.TextTruncate = Enum.TextTruncate.AtEnd
@@ -1968,7 +2016,7 @@ function UI:Build()
     rounded(self.Window, 13); stroke(self.Window)
     local header = make("Frame", self.Window, {Size = UDim2.new(1, 0, 0, 53), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, Active = true})
     label(header, "CRIMSON HUB", UDim2.fromOffset(16, 9), UDim2.new(1, -112, 0, 22), Palette.Text, 18)
-    label(header, "v2.0.1  |  NOT RUNTIME TESTED", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
+    label(header, "v" .. Hub.Version .. "  |  OFFICIAL GAME NOT VERIFIED", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
     button(header, "_", UDim2.new(1, -83, 0, 10), UDim2.fromOffset(30, 30), function() self:Minimize() end, true)
     button(header, "X", UDim2.new(1, -44, 0, 10), UDim2.fromOffset(30, 30), function() Hub:Cleanup() end)
     self.Nav = make("ScrollingFrame", self.Window, {BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 2})
@@ -2312,5 +2360,5 @@ Hub:Connect(Services.RunService.Heartbeat, function()
     if now - lastUI >= 0.3 then lastUI = now; Hub:RefreshUI() end
 end)
 Hub:Debug("Version", Hub.Version)
-Hub:Log("Crimson Hub v2.0.1 ready. Quest/flight/combat require live validation; manual recovery is available.")
+Hub:Log("Crimson Hub v2.0.2 QA ready. Official-game validation remains pending; Studio fixtures are isolated.")
 return Hub
