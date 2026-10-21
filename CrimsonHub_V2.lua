@@ -1,5 +1,5 @@
 --!nocheck
--- CRIMSON HUB 2.0 | Independent source | No downloaded code or external UI.
+-- CRIMSON HUB 2.0.1 | Independent source | No downloaded code or external UI.
 -- Live Blox Fruits / executor validation has NOT been performed.
 -- Source-observed schemas are revalidated at runtime. Never writes NPC health,
 -- quest progress, mastery, inventory, collision, hidden properties or hit packets.
@@ -7,7 +7,7 @@
 -- Upload the supplied Luffy PNG to Roblox, then put its real image asset ID here.
 -- Blank preserves the existing text opener; no unrelated image is substituted.
 local Config = {LuffyImageAssetId = "", Debug = true}
-local Hub = {Version = "2.0", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
+local Hub = {Version = "2.0.1", Destroyed = false, Connections = {}, UIConnections = {}, Logs = {}, TraceEntries = {}, Components = {}, DebugValues = {}}
 local Services = {}
 for _, name in ipairs({"Players", "Workspace", "ReplicatedStorage", "TweenService", "UserInputService", "RunService"}) do
     local ok, service = pcall(function() return game:GetService(name) end)
@@ -46,7 +46,7 @@ local Defaults = {
 local Settings = {}
 for k, v in pairs(Defaults) do Settings[k] = v end
 Hub.Settings = Settings
-local Screen, UI, Manager, Observer
+local Screen, UI, Manager, Observer, QuestTextResolver
 local FlightController, QuestStateDetector, QuestReceiver, WorldCatalog, SeaProgression, FruitService, RaidManager, EffectsController
 
 function Hub:IsAlive()
@@ -65,6 +65,8 @@ function Hub:ConnectUI(signal, callback)
 end
 function Hub:Log(message, isError)
     message = tostring(message):sub(1, 240)
+    local last = self.Logs[#self.Logs]
+    if last and last.Message == message and os.clock()-last.Time < 3 then return end
     if #self.Logs >= 50 then table.remove(self.Logs, 1) end
     table.insert(self.Logs, {Time = os.clock(), Message = message})
     if isError then self.LastError = message end
@@ -85,6 +87,7 @@ function Hub:Explain(message)
     local text = {
         QUEST_CONFIRMATION_TIMEOUT = "Quest chưa được UI game xác nhận. Xem phản hồi server; nhận quest thủ công rồi bấm Resume.",
         QUEST_SERVER_REJECTED = "Máy chủ từ chối nhận quest. Xem phản hồi trong log; kiểm tra level và yêu cầu mở khóa.",
+        QUEST_TEXT_UNRECOGNIZED = "Chưa nhận diện được chữ trên bảng quest. Đã giữ nguyên nhiệm vụ; xem Quest UI trong log.",
         QUEST_UI_UNREADABLE = "Chưa đọc được UI quest. Mở nhiệm vụ trong game rồi bấm Resume.",
         FLIGHT_NO_PROGRESS = "Bay bị chặn hoặc không được chấp nhận. Đã dừng điều khiển vị trí.",
         SEA_PREREQUISITES_MANUAL = "Cần hoàn thành điều kiện chuyển Sea bằng UI game. Xem phần Sea progression.",
@@ -118,8 +121,22 @@ end
 
 -- Pure functions are also exercised by the offline test runner.
 local Logic = {}
+-- Preserve Vietnamese identity when comparing observed localized UI text.
+-- ASCII string.lower alone neither folds Đ nor handles accented uppercase.
+local VietnameseFold = {}
+for _, group in ipairs({
+    {"a","àáảãạăằắẳẵặâầấẩẫậÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ"},
+    {"e","èéẻẽẹêềếểễệÈÉẺẼẸÊỀẾỂỄỆ"},
+    {"i","ìíỉĩịÌÍỈĨỊ"},
+    {"o","òóỏõọôồốổỗộơờớởỡợÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"},
+    {"u","ùúủũụưừứửữựÙÚỦŨỤƯỪỨỬỮỰ"},
+    {"y","ỳýỷỹỵỲÝỶỸỴ"}, {"d","đĐ"},
+}) do
+    for char in group[2]:gmatch("[\128-\255][\128-\191]*") do VietnameseFold[char] = group[1] end
+end
 function Logic.Canonical(name)
     local s = tostring(name or ""):lower():gsub("<[^>]*>", ""):gsub("%b[]", "")
+    s = s:gsub("[\128-\255][\128-\191]*", function(char) return VietnameseFold[char] or char end)
     return (s:gsub("[^%w%s]", " "):gsub("%s+", " "):match("^%s*(.-)%s*$"))
 end
 function Logic.TitleMatches(title, target)
@@ -127,6 +144,20 @@ function Logic.TitleMatches(title, target)
     if n == "" then return false end
     if t:find(" " .. n .. " ", 1, true) or t:find(" " .. n .. "s ", 1, true) then return true end
     if n:sub(-1) == "y" and t:find(" " .. n:sub(1, -2) .. "ies ", 1, true) then return true end
+    return false
+end
+-- Match a complete objective/target line, never a translated substring.
+-- This prevents Băng Cướp from also matching Băng Cướp Sa Mạc.
+function Logic.ObjectiveAliasMatches(title, alias)
+    alias = Logic.Canonical(alias)
+    if alias == "" then return false end
+    for line in tostring(title or ""):gmatch("[^|\r\n]+") do
+        line = line:gsub("<[^>]*>", ""):gsub("%d+%s*/%s*%d+", "")
+        local normalized = Logic.Canonical(line)
+        if normalized == alias then return true end
+        local subject = normalized:match("^danh bai %d+ (.+)$") or normalized:match("^defeat %d+ (.+)$")
+        if subject == alias then return true end
+    end
     return false
 end
 function Logic.Finite(n) return type(n) == "number" and n == n and math.abs(n) < math.huge end
@@ -366,6 +397,58 @@ function Jobs:Step(now)
     end
 end
 
+-- Optional official translator. Cloud loading has its own finite job and
+-- never substitutes an unconfirmed quest merely because kill totals agree.
+QuestTextResolver = {Status="NOT_LOADED", Cache={}, Failures={}}
+function QuestTextResolver:Load()
+    if self.Status=="READY" then return end
+    if Jobs.Pending.localization then return end
+    local ok, service=pcall(function() return game:GetService("LocalizationService") end)
+    if not ok or not service then
+        self.Status="UNAVAILABLE"; Hub:Debug("Quest localization","Service unavailable; source text / observed starter alias only")
+        return
+    end
+    self.Status="LOADING"
+    local started=Jobs:Start("localization",function() return service:GetTranslatorForPlayerAsync(Player) end,5,function(success,translator)
+        if success and translator then
+            self.Translator,self.Status,self.Cache=translator,"READY",{}
+            local localeOK,locale=pcall(function() return translator.LocaleId end)
+            self.Locale=localeOK and locale or "Unknown"
+            Hub:Debug("Quest localization","Translator ready: " .. tostring(self.Locale))
+        else
+            self.Status="UNAVAILABLE"
+            Hub:Debug("Quest localization","Translator unavailable: " .. Logic.Summary(translator))
+        end
+    end)
+    if not started then self.Status="UNAVAILABLE" end
+end
+function QuestTextResolver:Matches(title,row)
+    if Logic.TitleMatches(title,row.Target) then return true,"source" end
+    -- The only bundled translated NPC objective is observed in the user's
+    -- screenshot, tied to the known starter quest identity; no broad dictionary.
+    if row.Group==StarterBinding.Group and row.Index==StarterBinding.Index
+        and Logic.Canonical(row.Target)=="bandit"
+        and Logic.ObjectiveAliasMatches(title,"Băng Cướp") then return true,"observed Vietnamese starter" end
+    if self.Translator then
+        local main=PlayerGui:FindFirstChild("Main")
+        local context=main and main:FindFirstChild("Quest") or main or PlayerGui
+        local localeOK,locale=pcall(function() return self.Translator.LocaleId end)
+        if localeOK and locale~=self.Locale then self.Cache,self.Locale={},locale end
+        if self.Context~=context then self.Context,self.Cache=context,{} end
+        if self.Cache[row.Target]==nil then
+            local ok,translated=pcall(function() return self.Translator:Translate(context,row.Target) end)
+            self.Cache[row.Target]=ok and type(translated)=="string" and translated or false
+            if not ok and not self.Failures[row.Target] then
+                self.Failures[row.Target]=true
+                Hub:Debug("Quest translation " .. row.Target,"unavailable: " .. tostring(translated))
+            end
+        end
+        local alias=self.Cache[row.Target]
+        if alias and alias~=row.Target and Logic.ObjectiveAliasMatches(title,alias) then return true,"game translator" end
+    end
+    return false
+end
+
 local QuestDatabase = {Status = "NOT_LOADED", Rows = {}, NPCs = {}, Error = nil, Stats = {}}
 function QuestDatabase:Load()
     if self.Status == "LOADING" then return end
@@ -418,7 +501,7 @@ end
 function QuestSelector:FromTitle(title, level)
     local match
     for _, row in ipairs(QuestDatabase.Rows) do
-        if row.MinLevel <= level and Logic.TitleMatches(title, row.Target) then
+        if row.MinLevel <= level and QuestTextResolver:Matches(title, row) then
             if match and match.Target ~= row.Target then return nil end
             match = match or row
         end
@@ -439,8 +522,10 @@ function QuestStateDetector:Read(expected)
     if not main then return nil end
     local queue, candidates, seen, index = {main}, {}, {}, 1
     local primary = main:FindFirstChild("Quest")
-    if primary and primary:IsA("GuiObject") then table.insert(candidates, primary); seen[primary] = true end
-    while queue[index] and index <= 1200 do
+    local hasPrimary = primary and primary:IsA("GuiObject")
+    if hasPrimary then table.insert(candidates, primary); seen[primary] = true end
+    -- A known tracker has priority over quest menus, tutorials and other panels.
+    while not hasPrimary and queue[index] and index <= 1200 do
         local node = queue[index]; index = index + 1
         for _, child in ipairs(node:GetChildren()) do
             if #queue < 1200 then table.insert(queue, child) end
@@ -456,11 +541,16 @@ function QuestStateDetector:Read(expected)
         local texts, nodes, nextNode = {}, {container}, 1
         while nodes[nextNode] and nextNode <= 200 do
             local node = nodes[nextNode]; nextNode = nextNode + 1
-            if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleInGame(node) and node.Text ~= "" then table.insert(texts, node.Text) end
+            if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleInGame(node) then
+                if node.Text ~= "" then table.insert(texts,node.Text) end
+                local ok,displayed=pcall(function() return node.ContentText end)
+                if ok and type(displayed)=="string" and displayed~="" and displayed~=node.Text then table.insert(texts,displayed) end
+                if not ok then Hub:Debug("Quest ContentText","unavailable: " .. tostring(displayed)) end
+            end
             for _, child in ipairs(node:GetChildren()) do if #nodes < 200 then table.insert(nodes, child) end end
         end
         local text = table.concat(texts, " | ")
-        local match = expected and Logic.TitleMatches(text, expected.Target)
+        local match = expected and QuestTextResolver:Matches(text, expected)
             or QuestSelector:FromTitle(text, LevelDetector:Get() or 1) ~= nil
         local current, total = text:match("(%d+)%s*/%s*(%d+)")
         local view = {Visible = true, Text = text, Count = tonumber(current), Required = tonumber(total), Source = container.Name}
@@ -846,6 +936,7 @@ function FarmController:Start()
     self:Cleanup()
     self.Running, self.Paused, self.Started, self.State, self.Detail = true, false, os.clock(), "CHECKING", "Checking live data"
     Hub.DebugValues = {}
+    if self.Mode ~= "boss" then QuestTextResolver:Load() end
     if self.Mode ~= "boss" and QuestDatabase.Status ~= "READY" and QuestDatabase.Status ~= "LOADING" then QuestDatabase:Load() end
     return true
 end
@@ -865,6 +956,7 @@ function FarmController:Pause(reason)
 end
 function FarmController:Resume()
     if not self.Paused then return false end
+    if self.Mode~="boss" and QuestTextResolver.Status=="NOT_LOADED" then QuestTextResolver:Load() end
     self.Running, self.Paused, self.QuestAttempts, self.NPCWait, self.UIWait = true, false, 0, nil, nil
     self.Target, self.EncounterTarget, self.NoTargetSince = nil, nil, nil
     if self.Mode ~= "boss" and QuestDatabase.Status ~= "READY" and QuestDatabase.Status ~= "LOADING" then QuestDatabase:Load() end
@@ -908,8 +1000,15 @@ function FarmController:PrepareQuest(ctx, level, now)
     self.UIWait = nil
     Hub:Debug("Quest Status",view.Visible and view.Text or "No active quest")
     if view.Visible then
-        local current = self.Quest and Logic.TitleMatches(view.Text,self.Quest.Target) and self.Quest or QuestSelector:FromTitle(view.Text,level)
-        if not current then self:Pause("QUEST_MISMATCH: finish/abandon unrelated quest in game, then Resume"); return false end
+        local current = self.Quest and QuestTextResolver:Matches(view.Text,self.Quest) and self.Quest or QuestSelector:FromTitle(view.Text,level)
+        self.QuestText=view.Text
+        Hub:Debug("Quest UI source",view.Source or "Unknown")
+        if not current then
+            if QuestTextResolver.Status=="LOADING" then self:SetState("RECOVERING","Loading quest translations"); return false end
+            Hub:Trace("QUEST","UNRECOGNIZED","Expected " .. desired.Id .. " target=" .. desired.Target,view.Text)
+            self:Pause("QUEST_TEXT_UNRECOGNIZED: expected=" .. desired.Target .. "; UI=" .. view.Text:sub(1,120))
+            return false
+        end
         if view.Required and view.Required ~= current.Amount then self:Pause("QUEST_COUNT_MISMATCH: UI=" .. view.Required .. ", data=" .. current.Amount); return false end
         if self.RequestedQuestId == current.Id then
             self.ManagedQuestId = current.Id
@@ -1559,6 +1658,7 @@ Hub.Components.InventoryController = InventoryController
 Hub.Components.FlightController,Hub.Components.QuestReceiver,Hub.Components.QuestStateDetector=FlightController,QuestReceiver,QuestStateDetector
 Hub.Components.WorldCatalog,Hub.Components.SeaProgression,Hub.Components.FruitService=WorldCatalog,SeaProgression,FruitService
 Hub.Components.RaidManager,Hub.Components.EffectsController=RaidManager,EffectsController
+Hub.Components.QuestTextResolver=QuestTextResolver
 Hub.TaskManager = Manager
 function Hub:Trace(feature,state,action,evidence,errorMessage)
     local job=Manager and Manager.Active
@@ -1868,7 +1968,7 @@ function UI:Build()
     rounded(self.Window, 13); stroke(self.Window)
     local header = make("Frame", self.Window, {Size = UDim2.new(1, 0, 0, 53), BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, Active = true})
     label(header, "CRIMSON HUB", UDim2.fromOffset(16, 9), UDim2.new(1, -112, 0, 22), Palette.Text, 18)
-    label(header, "v2.0  |  NOT RUNTIME TESTED", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
+    label(header, "v2.0.1  |  NOT RUNTIME TESTED", UDim2.fromOffset(17, 32), UDim2.new(1, -112, 0, 16), Palette.Muted, 10)
     button(header, "_", UDim2.new(1, -83, 0, 10), UDim2.fromOffset(30, 30), function() self:Minimize() end, true)
     button(header, "X", UDim2.new(1, -44, 0, 10), UDim2.fromOffset(30, 30), function() Hub:Cleanup() end)
     self.Nav = make("ScrollingFrame", self.Window, {BackgroundColor3 = Palette.Sidebar, BorderSizePixel = 0, CanvasSize = UDim2.new(), ScrollBarThickness = 2})
@@ -2143,6 +2243,7 @@ function Hub:StopAll()
     FruitService.Pending=false; EffectsController:Stop()
     if UI then UI:CloseModal() end
     if QuestDatabase.Status == "LOADING" then QuestDatabase.Status, QuestDatabase.Error = "NOT_LOADED", nil end
+    if QuestTextResolver.Status=="LOADING" then QuestTextResolver.Status="NOT_LOADED" end
     self:RefreshUI()
 end
 function Hub:GetStatus() return Manager:Status() end
@@ -2211,5 +2312,5 @@ Hub:Connect(Services.RunService.Heartbeat, function()
     if now - lastUI >= 0.3 then lastUI = now; Hub:RefreshUI() end
 end)
 Hub:Debug("Version", Hub.Version)
-Hub:Log("Crimson Hub v2.0 ready. Quest/flight/combat require live validation; manual recovery is available.")
+Hub:Log("Crimson Hub v2.0.1 ready. Quest/flight/combat require live validation; manual recovery is available.")
 return Hub
